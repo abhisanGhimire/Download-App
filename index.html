@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Camera Spotter</title>
+<style>
+  :root { --bg:#111; --fg:#eee; --muted:#999; --accent:#4ade80; --other:#60a5fa; --card:#1c1c1e; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px system-ui,sans-serif; }
+  main { max-width:760px; margin:0 auto; padding:16px; }
+  h1 { font-size:1.3rem; margin:0 0 12px; }
+  .stage { position:relative; background:#000; border-radius:12px; overflow:hidden; aspect-ratio:4/3; }
+  video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+  .status { position:absolute; left:0; right:0; bottom:0; padding:8px 12px; background:rgba(0,0,0,.6); font-size:.9rem; }
+  .row { display:flex; gap:8px; margin:12px 0; flex-wrap:wrap; }
+  input { flex:1; min-width:180px; padding:10px; border-radius:8px; border:1px solid #333; background:var(--card); color:var(--fg); font-size:1rem; }
+  button { padding:10px 14px; border-radius:8px; border:0; background:var(--accent); color:#000; font-weight:600; font-size:1rem; cursor:pointer; }
+  button.secondary { background:#333; color:var(--fg); }
+  .chips { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:12px; }
+  .chip { background:var(--card); border:1px solid #333; border-radius:99px; padding:4px 10px; font-size:.85rem; cursor:pointer; }
+  .chip.on { border-color:var(--accent); color:var(--accent); }
+  #result { background:var(--card); border-radius:12px; padding:14px; min-height:64px; }
+  #result .match { color:var(--accent); font-weight:600; }
+  #result .none { color:var(--muted); }
+  p.hint { color:var(--muted); font-size:.85rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>📷 Camera Spotter</h1>
+
+  <div class="stage">
+    <video id="video" playsinline muted></video>
+    <canvas id="overlay"></canvas>
+    <div class="status" id="status">Press Start to open the camera.</div>
+  </div>
+
+  <div class="row">
+    <button id="start">Start camera</button>
+    <button id="flip" class="secondary" hidden>Flip camera</button>
+  </div>
+
+  <div class="row">
+    <input id="target" placeholder="What are you looking for? e.g. cup, laptop, person (comma separated)" autocomplete="off">
+    <button id="set" class="secondary">Set</button>
+  </div>
+  <div class="chips" id="chips"></div>
+
+  <div id="result"><span class="none">Nothing detected yet.</span></div>
+  <p class="hint">Runs fully in your browser (TensorFlow.js COCO-SSD, 80 everyday object types). No video leaves your device. Leave the search box empty to just list everything it sees.</p>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script>
+const COMMON = ["person","cup","bottle","laptop","cell phone","book","chair","keyboard","mouse","backpack","remote","scissors","clock","tv","cat","dog"];
+const $ = id => document.getElementById(id);
+const video = $("video"), canvas = $("overlay"), ctx = canvas.getContext("2d");
+let model = null, stream = null, facing = "environment", running = false;
+let targets = new Set();
+
+// --- targets ---
+function renderChips() {
+  $("chips").innerHTML = "";
+  COMMON.forEach(name => {
+    const c = document.createElement("span");
+    c.className = "chip" + (targets.has(name) ? " on" : "");
+    c.textContent = name;
+    c.onclick = () => { targets.has(name) ? targets.delete(name) : targets.add(name); syncInput(); renderChips(); };
+    $("chips").appendChild(c);
+  });
+}
+function syncInput() { $("target").value = [...targets].join(", "); }
+function readInput() {
+  targets = new Set($("target").value.split(",").map(s => s.trim().toLowerCase()).filter(Boolean));
+  renderChips();
+}
+$("set").onclick = readInput;
+$("target").addEventListener("keydown", e => { if (e.key === "Enter") readInput(); });
+const isMatch = label => [...targets].some(t => label === t || label.includes(t) || t.includes(label));
+
+// --- camera ---
+async function startCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: facing, width: { ideal: 1280 } }, audio: false });
+  video.srcObject = stream;
+  await video.play();
+  canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+}
+$("start").onclick = async () => {
+  $("start").disabled = true;
+  try {
+    $("status").textContent = "Requesting camera…";
+    await startCamera();
+    if (!model) { $("status").textContent = "Loading model…"; model = await cocoSsd.load(); }
+    $("flip").hidden = false; $("start").hidden = true;
+    $("status").textContent = "Looking…";
+    if (!running) { running = true; loop(); }
+  } catch (e) {
+    $("start").disabled = false;
+    $("status").textContent = "Error: " + (e.message || e.name) + (location.protocol === "http:" && location.hostname !== "localhost" ? " (camera needs HTTPS or localhost)" : "");
+  }
+};
+$("flip").onclick = async () => { facing = facing === "user" ? "environment" : "user"; try { await startCamera(); } catch (e) { $("status").textContent = "Error: " + e.message; } };
+
+// --- detection loop ---
+async function loop() {
+  if (video.readyState >= 2) {
+    const preds = (await model.detect(video)).filter(p => p.score >= 0.5);
+    draw(preds); report(preds);
+  }
+  requestAnimationFrame(loop);
+}
+function draw(preds) {
+  if (canvas.width !== video.videoWidth) { canvas.width = video.videoWidth; canvas.height = video.videoHeight; }
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.lineWidth = Math.max(2, canvas.width / 300);
+  ctx.font = `${Math.max(14, canvas.width / 40)}px system-ui`;
+  preds.forEach(p => {
+    const m = targets.size && isMatch(p.class);
+    const color = m ? "#4ade80" : "#60a5fa";
+    const [x, y, w, h] = p.bbox;
+    ctx.strokeStyle = color; ctx.strokeRect(x, y, w, h);
+    const text = `${m ? "✓ " : ""}${p.class} ${Math.round(p.score * 100)}%`;
+    const tw = ctx.measureText(text).width + 8, th = parseInt(ctx.font) + 6;
+    ctx.fillStyle = color; ctx.fillRect(x, Math.max(0, y - th), tw, th);
+    ctx.fillStyle = "#000"; ctx.fillText(text, x + 4, Math.max(th - 6, y - 6));
+  });
+}
+let lastHTML = "";
+function report(preds) {
+  const counts = {};
+  preds.forEach(p => counts[p.class] = (counts[p.class] || 0) + 1);
+  const names = Object.keys(counts);
+  let html;
+  if (!names.length) html = `<span class="none">Nothing recognised.</span>`;
+  else if (!targets.size) html = "I see: " + names.map(n => `${counts[n]}× ${n}`).join(", ");
+  else {
+    const hits = names.filter(isMatch);
+    const missing = [...targets].filter(t => !names.some(n => n === t || n.includes(t) || t.includes(n)));
+    html = hits.length
+      ? `<span class="match">✓ Match: ${hits.map(n => `${counts[n]}× ${n}`).join(", ")}</span>`
+      : `<span class="none">No match yet.</span>`;
+    if (missing.length) html += `<br><span class="none">Not seen: ${missing.join(", ")}</span>`;
+    const others = names.filter(n => !isMatch(n));
+    if (others.length) html += `<br><span class="none">Also in view: ${others.join(", ")}</span>`;
+  }
+  if (html !== lastHTML) { $("result").innerHTML = html; lastHTML = html; }
+  $("status").textContent = names.length ? `Seeing ${preds.length} object(s)` : "Looking…";
+}
+renderChips();
+</script>
+</body>
+</html>
