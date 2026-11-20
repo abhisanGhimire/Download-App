@@ -12,6 +12,7 @@
   h1 { font-family:var(--display); font-size:1.6rem; margin:0; text-wrap:balance; }
   p { margin:0; color:var(--muted); line-height:1.45; }
   label.field { display:flex; flex-direction:column; gap:6px; font-size:.85rem; color:var(--muted); }
+  select { font:inherit; font-size:1rem; padding:12px; border-radius:10px; border:1px solid var(--line); background:var(--card); color:var(--fg); min-width:0; }
   input[type=text] { font:inherit; font-size:1rem; padding:12px; border-radius:10px; border:1px solid var(--line); background:var(--card); color:var(--fg); min-width:0; }
   .btn { display:flex; align-items:center; justify-content:center; padding:16px; border-radius:12px; background:var(--accent); color:var(--accent-fg); font-weight:600; font-size:1.05rem; cursor:pointer; border:0; }
   .btn:focus-within, input:focus-visible { outline:3px solid var(--accent); outline-offset:2px; }
@@ -30,6 +31,10 @@
 
   <label class="field" for="target">Looking for (optional, comma separated)
     <input id="target" type="text" placeholder="e.g. red mug, house keys, ripe banana" autocomplete="off">
+  </label>
+
+  <label class="field" for="mode">Mode
+    <select id="mode"><option value="dobble" selected>Dobble: find the matching symbol on two cards</option><option value="objects">Objects: what is in the photo</option></select>
   </label>
 
   <label class="btn" for="photo">Take photo
@@ -74,6 +79,16 @@ $("photo").addEventListener("change", async e => {
     const { blob, url } = await shrink(file);
     $("preview").src = url; $("preview").hidden = false;
     const targets = $("target").value.split(",").map(s => s.trim()).filter(Boolean);
+    if ($("mode").value === "dobble") {
+      const dp = `The photo shows two (or more) round Dobble/Spot-It cards, each covered in small cartoon symbols. Exactly one symbol appears on both cards. List each card's symbols, then name the shared symbol(s) and say where it sits on each card (e.g. top left). Reply with JSON only: {"cards":[{"label":string,"symbols":[string]}],"shared":[{"symbol":string,"where":[string]}],"confidence":"high"|"medium"|"low"}. Label cards by position, like "left card" and "right card". If you cannot see two cards, return an empty shared list.`;
+      const d = await sample.json(dp, { images: [blob], modelTier: "default", cache: false });
+      const sh = d.shared || [];
+      let h = sh.length
+        ? `<div class="verdict yes">Match: ${sh.map(s => esc(s.symbol)).join(", ")}</div><ul>${sh.map(s => `<li><b>${esc(s.symbol)}</b>: ${(s.where || []).map(esc).join("; ")}</li>`).join("")}</ul><div class="small">Confidence: ${esc(d.confidence)}</div>`
+        : `<div class="verdict no">No match found</div><div class="small">Get both whole cards in the frame, flat and well lit.</div>`;
+      h += (d.cards || []).map(c => `<div class="small">${esc(c.label)}: ${(c.symbols || []).map(esc).join(", ")}</div>`).join("");
+      out.innerHTML = h; e.target.value = ""; return;
+    }
     const prompt = `Look at the attached photo. List the distinct objects you can clearly see.` +
       (targets.length ? ` The user is looking for: ${targets.join("; ")}. For each wanted item say whether it is present.` : "") +
       ` Reply with JSON only: {"objects":[string],"matches":[{"item":string,"found":boolean,"note":string}]}. ` +
