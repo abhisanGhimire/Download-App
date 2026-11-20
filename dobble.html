@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dobble Matcher</title>
+<style>
+  :root { --bg:#111; --fg:#eee; --muted:#9a9a9a; --accent:#4ade80; --card:#1c1c1e; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px system-ui,sans-serif; }
+  main { max-width:760px; margin:0 auto; padding:16px; display:flex; flex-direction:column; gap:12px; }
+  h1 { font-size:1.3rem; margin:0; }
+  .stage { position:relative; background:#000; border-radius:12px; overflow:hidden; }
+  canvas#view { width:100%; display:block; }
+  video { display:none; }
+  .status { position:absolute; left:0; right:0; bottom:0; padding:8px 12px; background:rgba(0,0,0,.65); font-size:.95rem; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; }
+  button { padding:12px 16px; border-radius:8px; border:0; background:var(--accent); color:#000; font-weight:600; font-size:1rem; cursor:pointer; }
+  button.secondary { background:#333; color:var(--fg); }
+  p { color:var(--muted); font-size:.9rem; margin:0; line-height:1.4; }
+</style>
+</head>
+<body>
+<main>
+  <h1>🃏 Dobble Matcher</h1>
+  <div class="stage">
+    <canvas id="view" width="960" height="720"></canvas>
+    <video id="video" playsinline muted></video>
+    <div class="status" id="status">Press Start, then show two cards side by side.</div>
+  </div>
+  <div class="row">
+    <button id="start">Start camera</button>
+    <button id="flip" class="secondary" hidden>Flip camera</button>
+  </div>
+  <p>Hold the phone steady above two cards lying flat, both fully in view and well lit. The matching symbol gets a green ring on each card. Runs entirely on your phone (OpenCV feature matching), no uploads.</p>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.10.0-release.1/dist/opencv.js"></script>
+<script>
+const W = 960, PATCH = 420;
+const $ = id => document.getElementById(id);
+const video = $("video"), view = $("view"), vctx = view.getContext("2d");
+const work = document.createElement("canvas"); work.width = W;
+let cvReady = false, stream = null, facing = "environment", running = false, last = null, lastAge = 99;
+
+// Resolves once OpenCV's wasm runtime has initialised.
+const cvLoaded = new Promise(res => {
+  const check = () => {
+    if (typeof cv !== "undefined") {
+      if (cv.Mat) return res();
+      if (cv.onRuntimeInitialized !== undefined || cv.then) { cv.onRuntimeInitialized = res; return; }
+    }
+    setTimeout(check, 100);
+  };
+  check();
+});
+
+// ---- card detection: round shapes that are brighter than what surrounds them ----
+function findCards(src) {
+  const gray = new cv.Mat(), blur = new cv.Mat(), circles = new cv.Mat();
+  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+  cv.GaussianBlur(gray, blur, new cv.Size(9, 9), 2);
+  const minR = Math.round(src.cols * 0.08), maxR = Math.round(src.cols * 0.3);
+  cv.HoughCircles(blur, circles, cv.HOUGH_GRADIENT, 1.2, minR * 1.2, 120, 20, minR, maxR);
+  const cand = [];
+  // mean brightness step across the rim: card (inside) minus table (outside)
+  const edge = (cx, cy, r) => {
+    let sum = 0, n = 0;
+    for (let t = 0; t < 40; t++) {
+      const co = Math.cos(t * Math.PI / 20), si = Math.sin(t * Math.PI / 20);
+      const xi = Math.round(cx + (r - 5) * co), yi = Math.round(cy + (r - 5) * si);
+      const xo = Math.round(cx + (r + 5) * co), yo = Math.round(cy + (r + 5) * si);
+      if (xi < 0 || yi < 0 || xi >= src.cols || yi >= src.rows || xo < 0 || yo < 0 || xo >= src.cols || yo >= src.rows) { sum -= 40; n++; continue; }
+      sum += blur.ucharAt(yi, xi) - blur.ucharAt(yo, xo); n++;
+    }
+    return sum / n;
+  };
+  for (let i = 0; i < circles.cols && i < 14; i++) {
+    let cx = circles.data32F[i * 3], cy = circles.data32F[i * 3 + 1], r = circles.data32F[i * 3 + 2];
+    let bestS = -1e9, bx = cx, by = cy, br = r;
+    for (let dx = -18; dx <= 18; dx += 6) for (let dy = -18; dy <= 18; dy += 6) for (let f = 0.7; f <= 1.4; f += 0.05) {
+      const sc = edge(cx + dx, cy + dy, r * f);
+      if (sc > bestS) { bestS = sc; bx = cx + dx; by = cy + dy; br = r * f; }
+    }
+    if (bestS > 18 && br >= minR) cand.push({ cx: bx, cy: by, r: br, a: bestS });
+  }
+  gray.delete(); blur.delete(); circles.delete();
+  cand.sort((x, y) => y.a - x.a);
+  const out = [];
+  for (const c of cand) if (out.every(o => Math.hypot(o.cx - c.cx, o.cy - c.cy) > 0.9 * (o.r + c.r))) out.push(c);
+  return out.slice(0, 2);
+}
+
+// ---- features for one card, in its own round, upright-agnostic patch ----
+function describeCard(src, card) {
+  const r = card.r, x = Math.round(card.cx - r), y = Math.round(card.cy - r), s = Math.round(2 * r);
+  const rect = new cv.Rect(Math.max(0, x), Math.max(0, y), Math.min(s, src.cols - Math.max(0, x)), Math.min(s, src.rows - Math.max(0, y)));
+  const crop = src.roi(rect), gray = new cv.Mat(), patch = new cv.Mat();
+  cv.cvtColor(crop, gray, cv.COLOR_RGBA2GRAY);
+  // keep geometry: pad if the card touches the frame edge
+  const sq = new cv.Mat(s, s, cv.CV_8UC1, new cv.Scalar(255));
+  gray.copyTo(sq.roi(new cv.Rect(rect.x - x, rect.y - y, rect.width, rect.height)));
+  cv.resize(sq, patch, new cv.Size(PATCH, PATCH), 0, 0, cv.INTER_AREA);
+  const mask = new cv.Mat(PATCH, PATCH, cv.CV_8UC1, new cv.Scalar(0));
+  cv.circle(mask, new cv.Point(PATCH / 2, PATCH / 2), Math.round(PATCH / 2 * 0.9), new cv.Scalar(255), -1);
+  const orb = new cv.ORB();
+  orb.setMaxFeatures(1500); orb.setFastThreshold(8); orb.setEdgeThreshold(15);
+  const kps = new cv.KeyPointVector(), des = new cv.Mat();
+  orb.detectAndCompute(patch, mask, kps, des);
+  const pts = [];
+  for (let i = 0; i < kps.size(); i++) { const p = kps.get(i).pt; pts.push([p.x, p.y]); }
+  crop.delete(); gray.delete(); sq.delete(); patch.delete(); mask.delete(); orb.delete(); kps.delete();
+  return { des, pts, scale: s / PATCH, x, y };
+}
+
+// ---- match two cards, then find the biggest group moving together (= one symbol) ----
+function matchCards(A, B) {
+  if (A.pts.length < 8 || B.pts.length < 8) return null;
+  const bf = new cv.BFMatcher(cv.NORM_HAMMING, false), mv = new cv.DMatchVectorVector();
+  bf.knnMatch(A.des, B.des, mv, 2);
+  const pairs = [];
+  for (let i = 0; i < mv.size(); i++) {
+    const m = mv.get(i);
+    if (m.size() < 2) continue;
+    const m0 = m.get(0), m1 = m.get(1);
+    if (m0.distance < 0.85 * m1.distance && m0.distance < 70) pairs.push([A.pts[m0.queryIdx], B.pts[m0.trainIdx]]);
+  }
+  bf.delete(); mv.delete();
+  if (pairs.length < 4) return null;
+  let best = [];
+  for (let it = 0; it < 500; it++) {
+    const i = (Math.random() * pairs.length) | 0, j = (Math.random() * pairs.length) | 0;
+    if (i === j) continue;
+    const [a1, b1] = pairs[i], [a2, b2] = pairs[j];
+    const dax = a2[0] - a1[0], day = a2[1] - a1[1], dbx = b2[0] - b1[0], dby = b2[1] - b1[1];
+    const la = Math.hypot(dax, day), lb = Math.hypot(dbx, dby);
+    if (la < 12 || la > 110) continue;
+    const sc = lb / la; if (sc < 0.5 || sc > 2) continue;
+    const th = Math.atan2(dby, dbx) - Math.atan2(day, dax), cs = Math.cos(th) * sc, sn = Math.sin(th) * sc;
+    const inl = [];
+    for (const [pa, pb] of pairs) {
+      const px = pa[0] - a1[0], py = pa[1] - a1[1];
+      const ex = cs * px - sn * py + b1[0] - pb[0], ey = sn * px + cs * py + b1[1] - pb[1];
+      if (ex * ex + ey * ey < 49) inl.push([pa, pb]);
+    }
+    if (inl.length > best.length) best = inl;
+  }
+  return best.length >= 5 ? best : null;
+}
+
+function ringOf(inl, side, card, info) {
+  const pts = inl.map(p => p[side]), n = pts.length;
+  const mx = pts.reduce((s, p) => s + p[0], 0) / n, my = pts.reduce((s, p) => s + p[1], 0) / n;
+  const spread = Math.max(...pts.map(p => Math.hypot(p[0] - mx, p[1] - my)));
+  return { x: info.x + mx * info.scale, y: info.y + my * info.scale, r: (spread + 14) * info.scale };
+}
+
+function analyze() {
+  const src = cv.imread(work);
+  let out = { cards: [], match: null };
+  try {
+    const cards = findCards(src);
+    out.cards = cards;
+    if (cards.length === 2) {
+      const A = describeCard(src, cards[0]), B = describeCard(src, cards[1]);
+      const inl = matchCards(A, B);
+      if (inl) out.match = { count: inl.length, a: ringOf(inl, 0, cards[0], A), b: ringOf(inl, 1, cards[1], B) };
+      A.des.delete(); B.des.delete();
+    }
+  } finally { src.delete(); }
+  return out;
+}
+
+function ring(c, color, w) { vctx.beginPath(); vctx.arc(c.x, c.y, c.r, 0, 7); vctx.strokeStyle = color; vctx.lineWidth = w; vctx.stroke(); }
+function render(res) {
+  res.cards.forEach(c => ring({ x: c.cx, y: c.cy, r: c.r }, "rgba(255,255,255,.55)", 3));
+  if (res.match) {
+    ring(res.match.a, "#4ade80", 6); ring(res.match.b, "#4ade80", 6);
+    vctx.beginPath(); vctx.moveTo(res.match.a.x, res.match.a.y); vctx.lineTo(res.match.b.x, res.match.b.y);
+    vctx.strokeStyle = "rgba(74,222,128,.6)"; vctx.lineWidth = 3; vctx.setLineDash([10, 8]); vctx.stroke(); vctx.setLineDash([]);
+  }
+}
+
+async function loop() {
+  if (video.readyState >= 2) {
+    work.height = Math.round(W * video.videoHeight / video.videoWidth);
+    view.height = work.height;
+    const wctx = work.getContext("2d"); wctx.drawImage(video, 0, 0, W, work.height);
+    vctx.drawImage(work, 0, 0);
+    if (cvReady) {
+      const t = performance.now();
+      let res; try { res = analyze(); } catch (e) { $("status").textContent = "Error: " + e.message; res = null; }
+      if (res) {
+        if (res.match) { last = res; lastAge = 0; } else lastAge++;
+        const show = res.match ? res : (lastAge < 4 ? last : res);
+        render(show);
+        $("status").textContent = res.cards.length < 2 ? `Show two cards fully in view (found ${res.cards.length})`
+          : show.match ? "✓ Match found: green rings" : "Two cards found, looking for the match…";
+      }
+      await new Promise(r => setTimeout(r, Math.max(0, 120 - (performance.now() - t))));
+    }
+  }
+  requestAnimationFrame(loop);
+}
+
+async function cam() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: facing, width: { ideal: 1280 } }, audio: false });
+  video.srcObject = stream; await video.play();
+}
+$("start").onclick = async () => {
+  $("start").disabled = true;
+  try {
+    $("status").textContent = "Requesting camera…"; await cam();
+    $("status").textContent = "Loading vision engine…"; await cvLoaded; cvReady = true;
+    $("start").hidden = true; $("flip").hidden = false;
+    if (!running) { running = true; loop(); }
+  } catch (e) {
+    $("start").disabled = false;
+    $("status").textContent = "Error: " + (e.message || e.name);
+  }
+};
+$("flip").onclick = async () => { facing = facing === "user" ? "environment" : "user"; try { await cam(); } catch (e) {} };
+
+// test hook
+window.__analyzeImage = async (url) => {
+  await cvLoaded;
+  const img = new Image(); img.src = url; await img.decode();
+  work.height = Math.round(W * img.height / img.width);
+  work.getContext("2d").drawImage(img, 0, 0, W, work.height);
+  return analyze();
+};
+</script>
+</body>
+</html>
